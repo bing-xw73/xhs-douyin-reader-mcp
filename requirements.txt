@@ -1,0 +1,5 @@
+mcp==1.30.0
+uvicorn==0.53.0
+httpx==0.28.1
+pillow==12.3.0
+python-dotenv==1.2.3
