@@ -14,3 +14,9 @@ Thumbs.db
 *.jpeg
 *.png
 *.webp
+
+.cache/
+*.sqlite3
+*.db
+*-wal
+*-shm

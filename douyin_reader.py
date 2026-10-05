@@ -16,8 +16,8 @@ from xhs_reader import (MOBILE_UA, PinnedHTTPSConnection, ReaderError,
 PAGE_DOMAINS = ('douyin.com', 'iesdouyin.com')
 MEDIA_DOMAINS = ('snssdk.com', 'douyinvod.com', 'zjcdn.com')
 IMAGE_DOMAINS = ('douyinpic.com',)
-MAX_VIDEO_BYTES = 100_000_000
-MAX_DURATION = 300
+MAX_VIDEO_BYTES = 150_000_000
+MAX_DURATION = 390
 
 
 def safe_url(url, domains):
@@ -146,18 +146,33 @@ class DouyinReader:
         url = safe_url(url, domains)
         p = urllib.parse.urlsplit(url)
         addresses = public_addresses(p.hostname)
-        with self.lock:
-            self.outbound.take()
-        conn = PinnedHTTPSConnection(p.hostname, addresses[0])
-        conn.timeout = timeout
         request_headers = {'User-Agent': MOBILE_UA, 'Accept-Encoding': 'identity', 'Connection': 'close'}
         request_headers.update(headers or {})
-        try:
-            conn.request('GET', urllib.parse.urlunsplit(('', '', p.path, p.query, '')), headers=request_headers)
-            return conn, conn.getresponse()
-        except BaseException:
-            conn.close()
-            raise
+        deadline = time.monotonic() + timeout
+        last_error = None
+        # DNS has already validated every address. Retry only network failures,
+        # retaining hostname TLS verification and the original total budget.
+        for address in addresses[:3]:
+            budget = deadline - time.monotonic()
+            if budget <= 0:
+                break
+            with self.lock:
+                self.outbound.take()
+            conn = PinnedHTTPSConnection(p.hostname, address)
+            conn.timeout = min(5, budget)
+            try:
+                conn.request('GET', urllib.parse.urlunsplit(('', '', p.path, p.query, '')), headers=request_headers)
+                response = conn.getresponse()
+                if conn.sock:
+                    conn.sock.settimeout(max(0.001, deadline - time.monotonic()))
+                return conn, response
+            except OSError as error:
+                conn.close()
+                last_error = error
+            except BaseException:
+                conn.close()
+                raise
+        raise last_error or TimeoutError('Network connection budget exhausted')
 
     def page(self, url, token):
         acquired = None
@@ -217,6 +232,12 @@ class DouyinReader:
                             page, alternate, updated = self.page(alternate, self.cookie[0])
                             self.cookie = updated or self.cookie
                             return parse_item(page, alternate)
+                    # Some short-link landing pages no longer issue ttwid. Switch
+                    # to the bounded mobile share flow on the next acquisition.
+                    ident = re.search(r'/(video|note|slides)/(\d+)', urllib.parse.urlsplit(final).path)
+                    if ident and not fresh:
+                        kind = 'video' if ident.group(1) == 'video' else 'note'
+                        final = 'https://m.douyin.com/share/' + kind + '/' + ident.group(2)
                     raise
             except ReaderError as error:
                 self.cookie = None

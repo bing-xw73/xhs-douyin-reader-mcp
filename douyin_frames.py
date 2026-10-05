@@ -17,6 +17,8 @@ from xhs_reader import ReaderError, error_result
 
 ASR_URL = 'https://api.siliconflow.cn/v1/audio/transcriptions'
 ASR_MODEL = 'FunAudioLLM/SenseVoiceSmall'
+ASR_MAX_BYTES = 50_000_000
+ASR_MAX_SECONDS = 3600
 MAX_CACHE_BYTES = 12 * 1024 * 1024
 
 
@@ -38,7 +40,7 @@ def run_media(command, deadline, timeout=25):
     try:
         result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, timeout=remaining(deadline, timeout),
-                                check=False, env={k:v for k,v in os.environ.items() if k not in ('SILICONFLOW_API_KEY','XHS_MCP_SECRET')})
+                                check=False, env={k:v for k,v in os.environ.items() if not any(s in k.upper() for s in ('KEY','SECRET','TOKEN'))})
     except subprocess.TimeoutExpired:
         raise ReaderError('PROCESSING_TIMEOUT', 'ffmpeg/ffprobe 超时，临时文件已安排清理。')
     except OSError:
@@ -59,7 +61,7 @@ def probe_file(path, deadline):
     duration = float((data.get('format') or {}).get('duration') or video.get('duration') or 0)
     durations = [duration] + [float(s.get('duration') or 0) for s in streams]
     if any(not math.isfinite(d) or d > MAX_DURATION for d in durations) or duration <= 0:
-        raise ReaderError('VIDEO_DURATION_LIMIT', '只处理时长不超过 5 分钟且时长可验证的视频。')
+        raise ReaderError('VIDEO_DURATION_LIMIT', '只处理时长不超过 6 分 30 秒且时长可验证的视频。')
     width, height = int(video.get('width') or 0), int(video.get('height') or 0)
     if min(width,height) <= 0 or width * height > 1920 * 1080:
         raise ReaderError('VIDEO_RESOLUTION_LIMIT', '当前服务内存限制下仅处理不超过 1080p 像素量的视频。')
@@ -71,7 +73,9 @@ def transcribe_audio(path, deadline):
     if not key:
         raise ReaderError('ASR_NOT_CONFIGURED', '语音识别 API key 尚未配置。')
     try:
-        budget = remaining(deadline, 65)
+        if path.stat().st_size > ASR_MAX_BYTES:
+            raise ReaderError('AUDIO_SIZE_LIMIT', '单段音频超过硅基流动 50 MB 限制。')
+        budget = remaining(deadline, 180)
         with path.open('rb') as audio, httpx.Client(timeout=httpx.Timeout(budget,connect=min(10,budget)),
                                                   follow_redirects=False,trust_env=False) as client:
             with client.stream('POST', ASR_URL, headers={'Authorization':'Bearer '+key},
@@ -80,13 +84,13 @@ def transcribe_audio(path, deadline):
                     raise ReaderError('ASR_HTTP_ERROR', '硅基流动语音识别返回 HTTP %s。' % response.status_code)
                 content = bytearray()
                 for chunk in response.iter_bytes():
-                    remaining(deadline,65)
+                    remaining(deadline,180)
                     content.extend(chunk)
                     if len(content) > 1024 * 1024:
                         raise ReaderError('ASR_RESPONSE_TOO_LARGE', '语音识别响应过大。')
                 value = json.loads(content)
                 text = value.get('text')
-                if not isinstance(text,str):
+                if not isinstance(text,str) or not text.strip():
                     raise ReaderError('ASR_INVALID_RESPONSE', '语音识别未返回有效文本。')
                 if len(text) > 64000:
                     raise ReaderError('ASR_RESPONSE_TOO_LARGE', '转写文本超过 64000 字符限制。')
@@ -100,6 +104,29 @@ def transcribe_audio(path, deadline):
         raise ReaderError('ASR_REQUEST_FAILED', '语音识别请求失败（%s）；未返回上游错误内容以保护凭据。' % type(error).__name__)
 
 
+def transcribe_video(video, folder, duration, deadline):
+    # PCM mono 16k uses 32,000 bytes/second. Leave a generous WAV/header margin.
+    segment_seconds = min(ASR_MAX_SECONDS, max(1, (ASR_MAX_BYTES - 4096) // 32000))
+    texts = []
+    for index in range(math.ceil(duration / segment_seconds)):
+        start = index * segment_seconds
+        length = min(segment_seconds, duration - start)
+        audio = folder / ('audio-%s.wav' % index)
+        try:
+            run_media(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
+                       '-threads','1','-protocol_whitelist','file,pipe','-ss',str(start),'-i',str(video),
+                       '-t',str(length),'-map','0:a:0','-vn','-sn','-dn','-ac','1','-ar','16000',
+                       '-c:a','pcm_s16le','-threads','1',str(audio)],deadline,60)
+            if audio.stat().st_size > ASR_MAX_BYTES:
+                raise ReaderError('AUDIO_SIZE_LIMIT', '分段音频仍超过 50 MB，已停止转写。')
+            texts.append(transcribe_audio(audio, deadline))
+        finally:
+            audio.unlink(missing_ok=True)
+    if not texts:
+        raise ReaderError('ASR_INVALID_RESPONSE', '没有可转写的音频。')
+    return '\n'.join(texts)
+
+
 class DouyinFrames:
     def __init__(self, reader):
         self.reader = reader
@@ -111,10 +138,10 @@ class DouyinFrames:
     def download(self, metadata, path, deadline):
         duration = metadata.get('duration_seconds')
         if duration is None or not math.isfinite(duration) or not 0 < duration <= MAX_DURATION:
-            raise ReaderError('VIDEO_DURATION_LIMIT', '只下载时长可验证且不超过 5 分钟的视频。')
+            raise ReaderError('VIDEO_DURATION_LIMIT', '只下载时长可验证且不超过 6 分 30 秒的视频。')
         size = metadata.get('size_bytes')
         if size is not None and size > MAX_VIDEO_BYTES:
-            raise ReaderError('VIDEO_SIZE_LIMIT', '视频文件超过 100 MB 限制。')
+            raise ReaderError('VIDEO_SIZE_LIMIT', '视频文件超过 150 MB 限制。')
         urls = metadata.get('_play_urls') or []
         for url in urls[:2]:
             conn = None
@@ -125,7 +152,7 @@ class DouyinFrames:
                 length = res.getheader('Content-Length') or ''
                 expected = int(length) if length.isdigit() else None
                 if expected is not None and expected > MAX_VIDEO_BYTES:
-                    raise ReaderError('VIDEO_SIZE_LIMIT', '视频文件超过 100 MB 限制。')
+                    raise ReaderError('VIDEO_SIZE_LIMIT', '视频文件超过 150 MB 限制。')
                 total = 0
                 prefix = bytearray()
                 with path.open('wb') as output:
@@ -138,7 +165,7 @@ class DouyinFrames:
                             break
                         total += len(chunk)
                         if total > MAX_VIDEO_BYTES:
-                            raise ReaderError('VIDEO_SIZE_LIMIT', '视频下载超过 100 MB，已中止。')
+                            raise ReaderError('VIDEO_SIZE_LIMIT', '视频下载超过 150 MB，已中止。')
                         if len(prefix) < 12:
                             prefix.extend(chunk[:12-len(prefix)])
                         if len(prefix) >= 12 and prefix[4:8] != b'ftyp':
@@ -160,7 +187,7 @@ class DouyinFrames:
         if metadata.get('type') == 'images':
             raise ReaderError('IMAGE_POST_USE_IMAGES', '这是图文帖，请调用 read_douyin_images；不会下载或转写背景音乐。')
         video = folder / 'video.mp4'
-        size = self.download(metadata, video, min(deadline, time.monotonic()+45))
+        size = self.download(metadata, video, min(deadline, time.monotonic()+120))
         duration, has_audio = probe_file(video, deadline)
         parts, timestamps, total = [], [], 0
         for index in range(count):
@@ -196,15 +223,7 @@ class DouyinFrames:
                     text = cached[1]
                     summary['transcription_cached'] = True
                 else:
-                    audio = folder / 'audio.wav'
-                    run_media(['ffmpeg','-nostdin','-hide_banner','-loglevel','error','-y',
-                               '-threads','1','-protocol_whitelist','file,pipe','-i',str(video),
-                               '-map','0:a:0','-vn','-sn','-dn','-ac','1','-ar','16000',
-                               '-c:a','pcm_s16le','-threads','1',str(audio)],deadline)
-                    if audio.stat().st_size > 10_000_000:
-                        raise ReaderError('AUDIO_SIZE_LIMIT','提取的音频超过大小限制。')
-                    text = transcribe_audio(audio,deadline)
-                    audio.unlink()
+                    text = transcribe_video(video, folder, duration, deadline)
                     self.transcripts[transcript_key] = (time.monotonic()+600,text)
                     while len(self.transcripts)>32:
                         self.transcripts.popitem(last=False)
@@ -232,7 +251,7 @@ class DouyinFrames:
                 summary = copy.deepcopy(summary)
                 summary['cached'] = True
                 return summary, parts
-            deadline = time.monotonic()+105
+            deadline = time.monotonic()+360
             metadata = self.reader.metadata(url)
             if metadata.get('type') == 'images':
                 raise ReaderError('IMAGE_POST_USE_IMAGES', '这是图文帖，请调用 read_douyin_images；不会下载或转写背景音乐。')

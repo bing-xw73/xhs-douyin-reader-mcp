@@ -14,11 +14,12 @@ TEXT_SUFFIXES = {
 PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "GitHub token": re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
-    "generic API token": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    "generic API token": re.compile(r"\bsk-[A-Za-z0-9_.-]{20,}\b"),
+    "JWT credential": re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
     "MCP URL credential": re.compile(r"https?://[^\s/]+/[A-Za-z0-9_-]{43,128}/mcp\b"),
 }
 ASSIGNMENT = re.compile(
-    r"(?im)^[ \t]*(?:MCP_SECRET|SILICONFLOW_API_KEY|GITHUB_TOKEN|GH_TOKEN)[ \t]*=[ \t]*(\S*)[ \t]*$"
+    r"(?im)^[ \t]*(?:MCP_SECRET|SILICONFLOW_API_KEY|OMNI_API_KEY|GITHUB_TOKEN|GH_TOKEN)[ \t]*=[ \t]*(\S*)[ \t]*$"
 )
 IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 
@@ -33,6 +34,11 @@ def publishable_files():
 
 def main():
     findings = []
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or any(part in SKIP_PARTS for part in path.parts):
+            continue
+        if path.suffix.lower() in {".mp4", ".wav", ".jpg", ".jpeg", ".png", ".webp", ".sqlite3", ".db"} or path.name.endswith(("-wal", "-shm")):
+            findings.append((str(path.relative_to(ROOT)), "private media or cache file in release tree"))
     for path in publishable_files():
         text = path.read_text(encoding="utf-8", errors="replace")
         relative = path.relative_to(ROOT)

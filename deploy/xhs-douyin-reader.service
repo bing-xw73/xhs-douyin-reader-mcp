@@ -6,6 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
+StateDirectory=xhs-douyin-reader-mcp
+StateDirectoryMode=0700
 WorkingDirectory=/opt/xhs-douyin-reader-mcp
 EnvironmentFile=/opt/xhs-douyin-reader-mcp/.env
 Environment=PYTHONDONTWRITEBYTECODE=1

@@ -21,14 +21,14 @@ class FrameTests(unittest.TestCase):
         with self.assertRaises(ReaderError): options(4,'true')
 
     def test_duration_and_size_preflight(self):
-        for data in ({'duration_seconds':301}, {'duration_seconds':float('nan')},
-                     {'duration_seconds':61,'size_bytes':100_000_001}):
+        for data in ({'duration_seconds':391}, {'duration_seconds':float('nan')},
+                     {'duration_seconds':61,'size_bytes':150_000_001}):
             with self.assertRaises(ReaderError):
                 self.worker.download(data,pathlib.Path('unused'),time.monotonic()+10)
         self.reader.open_media.assert_not_called()
 
     def test_actual_duration_and_resolution_checked(self):
-        for data in (b'{"format":{"duration":"301"},"streams":[{"codec_type":"video","width":1280,"height":720}]}',
+        for data in (b'{"format":{"duration":"391"},"streams":[{"codec_type":"video","width":1280,"height":720}]}',
                      b'{"format":{"duration":"61"},"streams":[{"codec_type":"video","width":3840,"height":2160}]}'):
             with patch('douyin_frames.run_media',return_value=data), self.assertRaises(ReaderError):
                 probe_file(pathlib.Path('unused'),time.monotonic()+10)
